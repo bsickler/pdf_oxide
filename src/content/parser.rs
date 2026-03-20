@@ -241,24 +241,34 @@ pub fn parse_content_stream_text_only(data: &[u8]) -> Result<Vec<Operator>> {
 /// preceding graphics state (q..cm) needed for correct CTM.
 ///
 /// Returns `None` on ambiguous cases (fallback to full scan).
-/// Lightweight forward scan that tracks graphics state (`q`/`Q`/`cm`) across
-/// the full content stream and records the accumulated CTM at each BT/Do position.
-///
-/// This is much cheaper than full parsing — it only recognizes three operator
-/// types and skips all path, color, and text operators. Numeric operands are
-/// tracked in a rolling buffer so `cm` operands are always available when the
-/// operator is encountered.
-///
-/// Graphics state snapshot at a text position: CTM + current font.
+/// Graphics state snapshot captured at a text position by [`forward_scan_ctm`].
 #[derive(Debug)]
 struct PrescanState {
+    /// Accumulated CTM components (a, b, c, d, e, f).
     ctm: (f32, f32, f32, f32, f32, f32),
-    /// Current font name and size (from most recent Tf), if any.
+    /// Current font name and size from the most recent `Tf` operator, if any.
     font: Option<(String, f32)>,
 }
 
-/// Returns one `PrescanState` per entry in `text_positions` (same order).
-/// Returns `None` if the scan encounters problems it can't recover from.
+/// Lightweight forward scan that tracks graphics state across the full content stream.
+///
+/// Scans the stream recognizing only `q`, `Q`, `cm`, and `Tf` operators, skipping
+/// all path, color, and text operators. Records the accumulated CTM and font state
+/// at each position in `text_positions`.
+///
+/// This is much cheaper than full parsing. Numeric operands are tracked in a
+/// rolling buffer so `cm` operands are always available when the operator is
+/// encountered.
+///
+/// # Arguments
+///
+/// * `data` - Raw content stream bytes
+/// * `text_positions` - Byte offsets of BT/Do operators to record state at
+///
+/// # Returns
+///
+/// One [`PrescanState`] per entry in `text_positions` (same order).
+/// Returns `None` if the scan encounters unrecoverable problems.
 fn forward_scan_ctm(data: &[u8], text_positions: &[usize]) -> Option<Vec<PrescanState>> {
     use crate::content::graphics_state::Matrix;
 
@@ -499,13 +509,14 @@ enum PrescanResult {
     Empty,
     /// Text regions found with complete CTM context from backward scan alone.
     Regions(Vec<(usize, usize)>),
-    /// Text regions found but backward scan hit 4KB limit for at least one BT.
-    /// Includes per-text-position CTM from a forward scan of the full stream.
-    /// Each entry in `ctms` corresponds to one text position (before merging).
+    /// Text regions with graphics state from a forward CTM scan.
+    ///
+    /// Used when the backward scan hit the 4KB limit for at least one BT,
+    /// meaning outer CTM context may be missing. Each region is paired with
+    /// the full graphics state at its BT/Do position.
     RegionsWithCtm {
         regions: Vec<(usize, usize)>,
-        /// Graphics state at each text position. After region merging, only the
-        /// state for the first text position in each merged region is used.
+        /// One entry per region, in the same order as `regions`.
         region_states: Vec<PrescanState>,
     },
 }
@@ -522,6 +533,22 @@ impl PrescanResult {
     }
 }
 
+/// SIMD-accelerated pre-scan to identify text-bearing regions in a content stream.
+///
+/// Finds BT/Do operators via memchr, then for each one determines the region
+/// boundaries and required graphics state. When the backward scan can capture
+/// all enclosing `q`/`cm` context within 4KB, returns [`PrescanResult::Regions`].
+/// Otherwise, runs a lightweight forward CTM scan to capture the full graphics
+/// state and returns [`PrescanResult::RegionsWithCtm`].
+///
+/// # Arguments
+///
+/// * `data` - Raw content stream bytes
+///
+/// # Returns
+///
+/// Returns `None` if the forward scan fails, signaling the caller to fall back
+/// to full stream parsing.
 fn prescan_text_regions(data: &[u8]) -> Option<PrescanResult> {
     fn is_boundary(b: u8) -> bool {
         b.is_ascii_whitespace()
@@ -660,13 +687,22 @@ fn prescan_text_regions(data: &[u8]) -> Option<PrescanResult> {
 }
 
 /// Scan backwards from `pos` to find the start of the graphics state context.
-/// Looks for an unmatched 'q' operator, handling nesting.
 ///
-/// Returns `(offset, hit_limit)` where `hit_limit` is true if the backward
-/// scan could not guarantee that all enclosing graphics state context was
-/// captured. This happens when the 4KB scan window doesn't reach the
-/// beginning of the data — there may be additional enclosing `q`/`cm`
-/// operators beyond the window that affect the CTM.
+/// Looks for the nearest unmatched `q` operator within a 4KB window,
+/// handling nested `q`/`Q` pairs.
+///
+/// # Arguments
+///
+/// * `data` - Full content stream bytes
+/// * `pos` - Byte offset to scan backwards from (typically a BT/Do position)
+///
+/// # Returns
+///
+/// `(offset, hit_limit)` where `offset` is the position of the nearest
+/// unmatched `q` (or `pos` if none found), and `hit_limit` is true if the
+/// 4KB scan window didn't reach the beginning of the data. When `hit_limit`
+/// is true, there may be additional enclosing `q`/`cm` operators beyond
+/// the window that affect the CTM.
 fn find_region_start(data: &[u8], pos: usize) -> (usize, bool) {
     // Simple backward scan: find the nearest line that starts with 'q' or
     // the beginning of data. We limit backward scan to 4KB for performance.
